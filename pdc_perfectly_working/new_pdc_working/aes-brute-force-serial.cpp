@@ -5,11 +5,11 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+// #include <thread>
 #include <string>
 #include <vector>
 #include <omp.h>
 #include <assert.h>
-#include <unistd.h>
 
 int hexdigit_value(char c){
     int nibble = -1;
@@ -29,18 +29,25 @@ size_t hexstr_to_bytes(uint8_t *dst, size_t dst_size, char *hexstr){
         dst_size = (len / 2);
     memset(dst, 0, dst_size);
 
+    #pragma omp parallel
+    #pragma omp for
     for(unsigned int i = 0; i < dst_size * 2; i++){
         unsigned int shift = 4 - 4 * (i & 1);
         unsigned int charIndex = i;
         char c = hexstr[charIndex];
         uint8_t nibble = hexdigit_value(c);
-        dst[i / 2] |= nibble << shift;
+        
+        #pragma omp critical
+        {
+            dst[i / 2] |= nibble << shift;
+        }
     }
     return dst_size;
 }
-
 void bytes_to_hexstr(char *dst, uint8_t *bytes, unsigned int nBytes) {
     unsigned int i;
+    #pragma omp parallel 
+    #pragma omp for
     for (i = 0; i < nBytes; i++) {
         sprintf(dst + 2 * i, "%02X", bytes[i]);
     }
@@ -49,6 +56,8 @@ void bytes_to_hexstr(char *dst, uint8_t *bytes, unsigned int nBytes) {
 size_t cleanup_hexstr(char *hexstr, size_t hexstr_size, const char *const str, size_t str_size){
     size_t cnt=0;
     int lastIs0=0;
+    //#pragma omp parallel
+    //#pragma omp for
     for(unsigned int j = 0;j<str_size;j++){
         char c = str[j];
         if(is_hexdigit(c)){
@@ -70,24 +79,54 @@ size_t cleanup_hexstr(char *hexstr, size_t hexstr_size, const char *const str, s
 
 static void print_bytes_sep(const char *msg, const unsigned char *buf, unsigned int size, const char m2[], const char sep[]){
     printf("%s", msg);
+    #pragma omp parallel 
+    #pragma omp for
     for(unsigned int i = 0; i < size - 1; i++) {
-        printf("%02X%s", buf[i], sep);
+        #pragma omp critical
+        {
+            printf("%02X%s", buf[i], sep);
+        }
     }
-    if(size > 0) {
-        printf("%02X", buf[size - 1]);
+    #pragma omp critical
+    {
+        if(size > 0) {
+            printf("%02X", buf[size - 1]);
+        }
+        printf("%s", m2);
     }
-    printf("%s", m2);
 }
 
+
 static void print_128(const char m[], const uint8_t a[16], const char m2[]){
-    print_bytes_sep(m, a, 4, "_", "");
-    print_bytes_sep("", a + 4, 4, "_", "");
-    print_bytes_sep("", a + 8, 4, "_", "");
-    print_bytes_sep("", a + 12, 4, m2, "");
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            print_bytes_sep(m, a, 4, "_", "");
+        }
+        #pragma omp section
+        {
+            print_bytes_sep("", a + 4, 4, "_", "");
+        }
+        #pragma omp section
+        {
+            print_bytes_sep("", a + 8, 4, "_", "");
+        }
+        #pragma omp section
+        {
+            print_bytes_sep("", a + 12, 4, m2, "");
+        }
+    }
 }
 
 static void println_128(const char m[], const uint8_t a[16]){
-    print_128(m, a, "\n");
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            print_128(m, a, "\n");
+        }
+    }
 }
 
 size_t user_hexstr_to_bytes(uint8_t* out, size_t out_size, char* str, size_t str_size){
@@ -115,6 +154,8 @@ public:
     static unsigned int mask_to_offsets(uint8_t key_mask[16], unsigned int offsets[16]){
         unsigned int n_offsets = 0;
         int partial_byte_idx=-1;
+        //#pragma omp parallel
+        //#pragma omp for
         for(unsigned int i=0;i<16;i++){
             if(key_mask[i]){//byte granularity
                 if(key_mask[i]!=0xFF) partial_byte_idx=n_offsets;
@@ -130,6 +171,7 @@ public:
         return n_offsets;
     }
 
+
     static void search( unsigned int offsets[16],
                 unsigned int n_offsets,
                 uint8_t key[16],                    // I/O
@@ -143,22 +185,26 @@ public:
         uint64_t n_loops = 1;
         uint64_t byte_range = byte_max + 1 - byte_min;
         for(unsigned int i = 0; i < n_offsets; i++){
-            n_loops *= byte_range;
+        n_loops *= byte_range;
         }
         found = false;
         loop_cnt = 0;
 
+        #pragma omp parallel
+        {
         uint8_t key_local[16];
         uint8_t r[16];
         memcpy(key_local, key, 16);
+        uint64_t local_loop_cnt = 0;
         
+        #pragma omp for schedule(static)
         for(uint64_t cnt = 0; cnt < n_loops; cnt++){
             if(done) continue;
 
             uint64_t tmp_cnt = cnt;
             for(unsigned int o = 0; o < n_offsets; o++){
-                key_local[offsets[o]] = byte_min + (tmp_cnt % byte_range);
-                tmp_cnt /= byte_range;
+            key_local[offsets[o]] = byte_min + (tmp_cnt % byte_range);
+            tmp_cnt /= byte_range;
             }
 
             __m128i key_schedule[11];
@@ -166,13 +212,20 @@ public:
             aes128_enc(key_schedule, plain, r);
 
             if(memcmp(r, cipher, 16) == 0){
+            #pragma omp critical
+            {
                 if(!found){
-                    found = true;
-                    done = true;
-                    memcpy(key, key_local, 16);
+                found = true;
+                done = true;
+                memcpy(key, key_local, 16);
                 }
             }
-            loop_cnt++;
+            }
+            local_loop_cnt++;
+        }
+
+        #pragma omp atomic
+        loop_cnt += local_loop_cnt;
         }
     }
 
@@ -190,7 +243,10 @@ public:
                     ){
         uint8_t r[16];
         uint64_t n_loops = 1;
+        n_loops = 1;
         
+        #pragma omp parallel
+        #pragma omp for reduction(*:n_loops)
         for(unsigned int i=0;i<n_offsets;i++){
             n_loops *= byte_range;
         }
@@ -200,6 +256,8 @@ public:
         uint8_t cnt8[16];
         memset(cnt8,byte_min,sizeof(cnt8));
         
+        #pragma omp parallel 
+        #pragma omp for
         for(unsigned int o=0;o<n_offsets;o++){
             uint8_t b=key[offsets[o]];
             if(b>byte_min){
@@ -210,6 +268,8 @@ public:
         for(loop_cnt=0;loop_cnt<n_loops;loop_cnt++){
             __m128i key_schedule[11];
             
+            #pragma omp parallel 
+            #pragma omp for
             for(unsigned int o=0;o<n_offsets;o++){
                 key[offsets[o]] = cnt8[o];
             }
@@ -228,6 +288,8 @@ public:
                 if(cnt8[b]!=byte_max) break;
             }
             
+            #pragma omp parallel 
+            #pragma omp for
             for(unsigned int i=0;i<b;i++){
                 cnt8[i] = byte_min;
             }
@@ -235,6 +297,7 @@ public:
             cnt8[b]=valid_bytes[cnt8[b]];
         }
     }
+
 
     explicit aes_brute_force(uint8_t key_mask[16], uint8_t key[16], uint8_t plain[16], uint8_t cipher[16], uint8_t byte_min, uint8_t byte_max) {
         aes128_key_t k;
@@ -276,33 +339,41 @@ public:
         loop_cnt = 0;
         found = false;
 
-        uint64_t local_loop_cnt = 0;
-        bool local_found = false;
-        uint8_t local_correct_key[16];
+        #pragma omp parallel
+        {
+            uint64_t local_loop_cnt = 0;
+            bool local_found = false;
+            uint8_t local_correct_key[16];
 
-        for(size_t i = 0; i < keys.size(); ++i) {
-            if (found || is_done())
-                continue;
+            #pragma omp for nowait
+            for(size_t i = 0; i < keys.size(); ++i) {
+                if (found || is_done())
+                    continue;
 
-            uint64_t cnt = 0;
-            if (continuous_range)
-                search(offsets, n_offsets, keys[i].bytes, plain, cipher, byte_min, byte_max, cnt, local_found);
-            else
-                search(offsets, n_offsets, keys[i].bytes, plain, cipher, byte_min, byte_max, valid_bytes, byte_range, cnt, local_found);
+                uint64_t cnt = 0;
+                if (continuous_range)
+                    search(offsets, n_offsets, keys[i].bytes, plain, cipher, byte_min, byte_max, cnt, local_found);
+                else
+                    search(offsets, n_offsets, keys[i].bytes, plain, cipher, byte_min, byte_max, valid_bytes, byte_range, cnt, local_found);
 
-            local_loop_cnt += cnt;
+                local_loop_cnt += cnt;
 
-            if (local_found) {
-                memcpy(local_correct_key, keys[i].bytes, 16);
-                if (!found) {
-                    found = true;
-                    memcpy(correct_key, local_correct_key, 16);
-                    set_done();
+                if (local_found) {
+                    memcpy(local_correct_key, keys[i].bytes, 16);
+                    #pragma omp critical
+                    {
+                        if (!found) {
+                            found = true;
+                            memcpy(correct_key, local_correct_key, 16);
+                            set_done();
+                        }
+                    }
                 }
             }
-        }
 
-        loop_cnt += local_loop_cnt;
+            #pragma omp atomic
+            loop_cnt += local_loop_cnt;
+        }
     }
 
     void operator()() {
@@ -329,7 +400,7 @@ public:
     uint8_t valid_bytes[256];
     uint64_t byte_range;
     bool continuous_range;
-};;
+};
 bool aes_brute_force::done=false;
 
 int main (int argc, char*argv[]){
@@ -376,7 +447,7 @@ int main (int argc, char*argv[]){
     len=user_hexstr_to_bytes(key_in  ,16,argv[2],strlen(argv[2])+1);assert(16==len);
     len=user_hexstr_to_bytes(plain   ,16,argv[3],strlen(argv[3])+1);assert(16==len);
     len=user_hexstr_to_bytes(cipher  ,16,argv[4],strlen(argv[4])+1);assert(16==len);
-    unsigned int n_threads = 1;
+    unsigned int n_threads = omp_get_max_threads();
     if(0==n_threads) n_threads=1;
     int usage=1;
     if(argc>5){
@@ -428,6 +499,8 @@ int main (int argc, char*argv[]){
     }
 
     unsigned int last = byte_min;
+    //#pragma omp parallel
+    //#pragma omp for
     for(uint32_t i=0;i<byte_range;i++){
         valid_bytes[last]=input_bytes[i];
         if(i>0) assert(last < input_bytes[i]);
@@ -465,7 +538,7 @@ int main (int argc, char*argv[]){
 
     unsigned int bit_per_byte = 1;
     while((1u<<(bit_per_byte+1u)) <= byte_range){bit_per_byte++;}
-    
+
     if(n_threads>1){
         uint32_t key_mask_width = 0;
         uint32_t key_mask;
@@ -474,6 +547,8 @@ int main (int argc, char*argv[]){
             key_mask = 1<<key_mask_width;
         }while(key_mask < n_threads);
         unsigned int n_offsets=0;
+        //#pragma omp parallel
+        //#pragma omp for
         for(unsigned int i=0;i<(key_mask_width+bit_per_byte-1)/bit_per_byte;i++){
             jobs_key_mask[offsets[n_offsets++]] = 0;
         }
@@ -505,7 +580,7 @@ int main (int argc, char*argv[]){
             for(unsigned int i=0;i<b;i++){
                 cnt8[i] = byte_min;
             }
-            cnt8[b]=valid_bytes[cnt8[b]];
+            cnt8[b] = valid_bytes[cnt8[b]];
         }
     }else{
         if(n_threads>1){
@@ -514,23 +589,25 @@ int main (int argc, char*argv[]){
         int n_keys_per_thread = n_threads==1 ? 0 : (byte_range+n_threads-1) / n_threads;
         unsigned int jobs_cnt=0;
         unsigned int job_byte_offset = 0;
+        #pragma omp parallel 
+        #pragma omp for schedule(static)
         for(unsigned int thread_i = 0; thread_i < n_threads; thread_i++) {
             uint8_t local_key_in[16];
             memcpy(local_key_in, key_in, 16);
             local_key_in[offsets[job_byte_offset]] = byte_min + jobs_cnt;
             jobs_cnt++;
             if(local_key_in[offsets[job_byte_offset]] > byte_max) {
-                local_key_in[offsets[job_byte_offset]] = byte_max;
-                job_byte_offset++;
-                jobs_key_mask[offsets[job_byte_offset]] = 0;
-                local_key_in[offsets[job_byte_offset]] = byte_min;
+            local_key_in[offsets[job_byte_offset]] = byte_max;
+            job_byte_offset++;
+            jobs_key_mask[offsets[job_byte_offset]] = 0;
+            local_key_in[offsets[job_byte_offset]] = byte_min;
             }
             jobs.at(thread_i) = new aes_brute_force(jobs_key_mask, local_key_in, plain, cipher, byte_min, byte_max);
             for(int i = 0; i < n_keys_per_thread - 1; i++) {
-                local_key_in[offsets[job_byte_offset]] = byte_min + jobs_cnt;
-                jobs_cnt++;
-                if(local_key_in[offsets[job_byte_offset]] <= byte_max)
-                    jobs.at(thread_i)->push(local_key_in);
+            local_key_in[offsets[job_byte_offset]] = byte_min + jobs_cnt;
+            jobs_cnt++;
+            if(local_key_in[offsets[job_byte_offset]] <= byte_max)
+                jobs.at(thread_i)->push(local_key_in);
             }
         }
     }
@@ -543,13 +620,18 @@ int main (int argc, char*argv[]){
     uint64_t loop_cnt=0;
     int winner=-1;
 
+    #pragma omp parallel 
+    #pragma omp for reduction(+:loop_cnt) shared(found, winner, key_in)
     for(unsigned int thread_i=0;thread_i<n_threads;thread_i++){
         jobs.at(thread_i)->compute();
         if(jobs.at(thread_i)->found){
-            if(!found){
-                found = true;
-                winner = thread_i;
-                memcpy(key_in, jobs.at(thread_i)->correct_key, 16);
+            #pragma omp critical
+            {
+                if(!found){
+                    found = true;
+                    winner = thread_i;
+                    memcpy(key_in, jobs.at(thread_i)->correct_key, 16);
+                }
             }
         }
         loop_cnt += jobs.at(thread_i)->loop_cnt;
@@ -581,7 +663,13 @@ int main (int argc, char*argv[]){
         if(found){
             const uint8_t expected_key[] = {0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c};
             bool matches;
-            matches = (memcmp(expected_key,key_in,16) == 0);
+            #pragma omp parallel
+            {
+                #pragma omp single
+                {
+                    matches = (memcmp(expected_key,key_in,16) == 0);
+                }
+            }
             if(!matches){
                 std::cout << "ERROR: key found is not the expected one! That worth a debug session!" << std::endl;
                 return -1;
